@@ -116,6 +116,20 @@ export default function Dashboard() {
     return order.map(process => wafers.filter(w => w.current_process === process && ['READY', 'PROCESSING', 'HOLD'].includes(w.status)).length);
   }, [wafers]);
 
+  const fabFlow = useMemo(() => {
+    const order = ['LITHOGRAPHY', 'ETCH', 'DEPOSITION', 'INSPECTION'];
+    return order.map(process => {
+      const station = equipment.find(eq => eq.process_type === process);
+      return {
+        process,
+        equipmentCode: station?.equipment_code ?? '—',
+        name: station?.name ?? process,
+        status: station?.status ?? 'IDLE',
+        wafer: station?.current_wafer_id ?? '—',
+      };
+    });
+  }, [equipment]);
+
   const inspect = async (code: string) => {
     setSelectedCode(code);
     try {
@@ -153,6 +167,26 @@ export default function Dashboard() {
         <Metric label="Completed" value={dashboard?.stats.completed ?? '—'} />
         <Metric label="Scrapped" value={dashboard?.stats.scrapped ?? '—'} />
         <Metric label="Inspection yield" value={dashboard ? `${dashboard.yield_pct}%` : '—'} />
+      </section>
+
+      <section className="panel fab-visual-panel">
+        <div className="panel-title"><h2>Fab floor view</h2><span>live process flow</span></div>
+        <div className="fab-flow">
+          {fabFlow.map((station, index) => (
+            <div className="fab-station-wrap" key={station.process}>
+              <div className={`fab-station ${station.status.toLowerCase()}`}>
+                <div className="station-header">
+                  <span className="station-label">{station.process}</span>
+                  <span className={`station-status ${station.status.toLowerCase()}`}>{station.status}</span>
+                </div>
+                <strong>{station.equipmentCode}</strong>
+                <span>{station.name}</span>
+                <div className="station-wafer">{station.wafer === '—' ? 'Awaiting wafer' : station.wafer}</div>
+              </div>
+              {index < fabFlow.length - 1 && <div className="fab-arrow">→</div>}
+            </div>
+          ))}
+        </div>
       </section>
 
       <section className="grid-two">
