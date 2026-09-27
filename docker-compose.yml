@@ -1,0 +1,86 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: fab
+      POSTGRES_USER: fab
+      POSTGRES_PASSWORD: fab
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fab -d fab"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  mqtt:
+    image: eclipse-mosquitto:2
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./mosquitto/config/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mosquitto_sub -h localhost -t '$$SYS/broker/clients/connected' -C 1 -W 3 >/dev/null 2>&1 || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build: ./services/api
+    environment:
+      DATABASE_URL: postgresql+psycopg2://fab:fab@postgres:5432/fab
+      DEMO_WAFERS: 50
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+
+  gateway:
+    build: ./services/gateway
+    environment:
+      DATABASE_URL: postgresql+psycopg2://fab:fab@postgres:5432/fab
+      MQTT_HOST: mqtt
+      MQTT_PORT: 1883
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mqtt:
+        condition: service_started
+      api:
+        condition: service_started
+
+  simulator:
+    build: ./services/simulator
+    environment:
+      DATABASE_URL: postgresql+psycopg2://fab:fab@postgres:5432/fab
+      API_URL: http://api:8000
+      MQTT_HOST: mqtt
+      MQTT_PORT: 1883
+      TELEMETRY_INTERVAL: 1
+      FAILURE_AFTER_SECONDS: 35
+      FAILURE_DURATION_SECONDS: 15
+    depends_on:
+      api:
+        condition: service_started
+      mqtt:
+        condition: service_started
+      gateway:
+        condition: service_started
+
+  web:
+    build: ./web
+    environment:
+      # Next.js proxies browser requests from /api to the internal Docker API service.
+      API_PROXY_TARGET: http://api:8000
+    depends_on:
+      api:
+        condition: service_started
+    ports:
+      - "3000:3000"
+
+volumes:
+  postgres_data:
