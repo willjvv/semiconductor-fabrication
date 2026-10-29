@@ -10,6 +10,8 @@ import paho.mqtt.client as mqtt
 import requests
 from sqlalchemy import create_engine, text
 
+from opcua_server import EquipmentOpcUaServer
+
 API_URL = os.getenv("API_URL", "http://localhost:8000")
 MQTT_HOST = os.getenv("MQTT_HOST", "localhost")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
@@ -31,6 +33,7 @@ FAILURE_RATES = {"LITHOGRAPHY": 0.02, "ETCH": 0.03, "DEPOSITION": 0.02, "INSPECT
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 random.seed(9026)
+opcua_server = EquipmentOpcUaServer()
 
 
 @dataclass
@@ -87,6 +90,10 @@ def get_ready_wafers() -> list[dict]:
 
 
 def publish(client: mqtt.Client, topic: str, payload: dict):
+    if topic == "fab/events":
+        opcua_server.update_from_event(payload)
+    elif topic.startswith("fab/telemetry/"):
+        opcua_server.update_from_telemetry(payload)
     client.publish(topic, json.dumps(payload), qos=1)
 
 
@@ -149,6 +156,7 @@ def run():
     failure_elapsed = 0.0
 
     wait_for_api()
+    opcua_server.start()
     reset()
     client.connect(MQTT_HOST, MQTT_PORT, 60)
     client.loop_start()

@@ -45,6 +45,9 @@ services:
       DATABASE_URL: postgresql+psycopg2://fab:fab@postgres:5432/fab
       MQTT_HOST: mqtt
       MQTT_PORT: 1883
+      OPCUA_URL: opc.tcp://simulator:4840/minifab/server/
+      OPCUA_SAMPLE_INTERVAL: 0.5
+      OPCUA_NAMESPACE_URI: urn:minifab:equipment
     depends_on:
       postgres:
         condition: service_healthy
@@ -63,6 +66,10 @@ services:
       TELEMETRY_INTERVAL: 1
       FAILURE_AFTER_SECONDS: 35
       FAILURE_DURATION_SECONDS: 15
+      OPCUA_ENDPOINT: opc.tcp://0.0.0.0:4840/minifab/server/
+      OPCUA_NAMESPACE_URI: urn:minifab:equipment
+    ports:
+      - "4840:4840"
     depends_on:
       api:
         condition: service_started
