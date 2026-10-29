@@ -33,7 +33,7 @@ Silicon / Lot
  PASS / SCRAP
 ```
 
-Each station has a simulated machine. Machines generate telemetry while processing a wafer. The telemetry travels through MQTT into an edge-gateway service, where it is persisted to PostgreSQL. The simulator also emits manufacturing events such as `ProcessStarted`, `ProcessCompleted`, `EquipmentDown`, `EquipmentRepaired`, `WaferHold`, `WaferReleased`, and `QualityResult`.
+Each station has a simulated machine. Machines generate telemetry while processing a wafer. Machine telemetry is exposed by the simulator as read-only OPC-UA tags. The gateway reads those tags, normalizes each changed equipment snapshot, and republishes it to MQTT before it is persisted to PostgreSQL. Manufacturing events still travel directly over MQTT. The simulator also emits events such as `ProcessStarted`, `ProcessCompleted`, `EquipmentDown`, `EquipmentRepaired`, `WaferHold`, `WaferReleased`, and `QualityResult`.
 
 The FastAPI service exposes that information as an MES-style API, and the Next.js dashboard polls the API to show the live factory state.
 
@@ -114,7 +114,7 @@ This is the beginning of the forward/backward traceability model that a larger M
 
 ### Equipment telemetry
 
-While a machine is running, the simulator publishes synthetic values including:
+While a machine is running, the simulator updates read-only OPC-UA tags for:
 
 - temperature
 - pressure
@@ -122,14 +122,15 @@ While a machine is running, the simulator publishes synthetic values including:
 - machine status
 - current wafer
 - remaining process time
+- alarm code and last event
 
-Example MQTT topic:
+The gateway reads these tags and publishes changed, normalized snapshots to the MQTT topic:
 
 ```text
-fab/telemetry/ETCH-01
+fab/telemetry/normalized/ETCH-01
 ```
 
-The gateway subscribes to the telemetry topics and writes readings to PostgreSQL.
+The existing MQTT consumer then persists those values to PostgreSQL. Simulator telemetry does not bypass the OPC-UA collector.
 
 ### Event-driven process tracking
 
@@ -196,39 +197,33 @@ The Next.js dashboard provides:
                          |     Next.js Dashboard     |
                          |       localhost:3000      |
                          +-------------+-------------+
-                                       |
-                                      HTTP
-                                       |
+                                       | HTTP
                          +-------------v-------------+
                          |      FastAPI MES API      |
                          |       localhost:8000      |
                          +-------------+-------------+
-                                       |
-                                       v
-                              +----------------+
+                                       | reads
+                              +--------v--------+
                               |   PostgreSQL    |
                               |   fab database  |
-                              +-------^--------+
-                                      |
-                               reads / writes
-                                      |
-                         +------------+-----------+
-                         |     Edge Gateway       |
-                         | MQTT -> PostgreSQL     |
-                         +------------^-----------+
-                                      |
-                                     MQTT
-                                      |
-                              +-------^--------+
-                              |    Mosquitto    |
-                              | localhost:1883  |
-                              +-------^--------+
-                                      |
-                              +-------+--------+
-                              | Fab Simulator   |
-                              | wafers +       |
-                              | equipment      |
-                              +----------------+
+                              +--------^--------+
+                                       | writes
+                         +-------------+-------------+
+                         |       Edge Gateway        |
+                         | OPC-UA reader + MQTT      |
+                         | normalize + persist       |
+                         +------+---------------+----+
+                                |               ^
+                       OPC-UA reads              | normalized telemetry
+                                |               | and process events
+                         +------v------+  +-----+---------+
+                         | Fab         |  |   Mosquitto   |
+                         | Simulator   |  | MQTT broker   |
+                         | OPC-UA :4840|  | :1883         |
+                         +-------------+  +-----^---------+
+                                |                |
+                                +----------------+
+                              simulator publishes events
 ```
 
 ### Why the gateway is separate
@@ -267,11 +262,15 @@ semiconductor-fab-mes-mvp/
 │   ├── gateway/
 │   │   ├── Dockerfile
 │   │   ├── main.py
+│   │   ├── verify_m2.py
 │   │   └── requirements.txt
 │   └── simulator/
 │       ├── Dockerfile
 │       ├── main.py
+│       ├── opcua_server.py
 │       └── requirements.txt
+├── tests/
+│   └── test_opcua_server.py
 └── web/
     ├── Dockerfile
     ├── next.config.mjs
@@ -284,6 +283,93 @@ semiconductor-fab-mes-mvp/
         └── page.tsx
 ```
 
+## Milestone 2 — OPC-UA equipment connectivity
+
+M2 keeps the existing MES and dashboard but changes how machine telemetry enters the system. The simulator exposes four machines through a read-only OPC-UA server; the gateway connects as an OPC-UA client, reads equipment tag snapshots, normalizes them, and publishes changed snapshots into MQTT. The existing MQTT-to-PostgreSQL writer remains the persistence path.
+
+```text
+Simulated fab / read-only OPC-UA server (:4840)
+    Objects / Equipment / LITHO-01 / TemperatureC, PressureMTorr, ...
+    Objects / Equipment / ETCH-01  / TemperatureC, PressureMTorr, ...
+                         |
+                         | OPC-UA client reads / reconnects
+                         v
+               Integration gateway
+                         |
+                         | MQTT: fab/telemetry/normalized/{equipment_code}
+                         v
+              MQTT consumer -> PostgreSQL -> FastAPI -> Dashboard
+```
+
+### Equipment tags
+
+Each of `LITHO-01`, `ETCH-01`, `DEP-01`, and `METRO-01` exposes these variables under `Objects / Equipment / {equipment_code}`:
+
+- `TemperatureC` (Double)
+- `PressureMTorr` (Double)
+- `RFPowerW` (Double)
+- `MachineState` (String: `IDLE`, `RUNNING`, `HOLD`, or `DOWN`)
+- `CurrentWaferCode` (String)
+- `RemainingSeconds` (Double)
+- `ProcessType` (String)
+- `RuntimeIncrementSeconds` (Double)
+- `Timestamp` (UTC ISO-8601 string for the source update)
+- `AlarmCode` (Integer; `1001` for the demo ETCH alarm, otherwise `0`)
+- `LastEvent` (String)
+
+Namespace URI: `urn:minifab:equipment`.
+
+### Normalized MQTT message
+
+The gateway samples the OPC-UA tags every 0.5 seconds and publishes only when the snapshot changes. Example topic: `fab/telemetry/normalized/ETCH-01`. Each message preserves the source timestamp and includes `source: "opcua"`, the collection timestamp, equipment state, active wafer, temperature, pressure, RF power, remaining process time, runtime increment, alarm code, and last event. QoS 1 is used for MQTT delivery; the database consumer stores the source fields in the existing JSONB payload.
+
+The gateway reconnects to OPC-UA with bounded backoff, re-discovers the namespace and tag nodes, and resumes publishing after the server returns. MQTT reconnection continues to be handled by Paho. This is a development/demo setup with anonymous local access, not a security-hardened production endpoint; do not expose port 4840 to the public internet or connect it to physical equipment.
+
+### Run and verify M2
+
+Start the stack as usual:
+
+```bash
+docker compose up --build
+```
+
+Useful addresses:
+
+- Dashboard: `http://localhost:3000`
+- MES API: `http://localhost:8000`
+- API docs: `http://localhost:8000/docs`
+- OPC-UA endpoint: `opc.tcp://localhost:4840/minifab/server/`
+- MQTT broker: `localhost:1883`
+
+The dashboard equipment rows now show the latest OPC-UA-derived temperature, pressure, RF power, sample time, and telemetry source. The API endpoint `GET /equipment` exposes the same latest values.
+
+Run the smoke check inside the gateway container after the simulation has started:
+
+```bash
+docker compose exec gateway python verify_m2.py
+# Or, if you have make installed:
+make verify-m2
+```
+
+Expected result: all four OPC-UA equipment objects and their tags are readable, and at least two machines have telemetry in the MES API with source `opcua`.
+
+To test disconnect/reconnect recovery:
+
+1. Run `docker compose logs -f gateway` in one terminal.
+2. In another terminal run `docker compose restart simulator`.
+3. Watch the gateway report an OPC-UA connection/read error while the server is restarting, then report `connected; monitoring 4 equipment assets` and resume telemetry. The simulator intentionally resets the demo production run when restarted, so this test restarts the wafer run as well.
+
+Unit tests for tag exposure, value updates, and the simulated `DOWN` → `IDLE` recovery transition are in `tests/test_opcua_server.py`. With Python and the simulator requirements installed locally, run:
+
+```bash
+python -m pip install -r services/simulator/requirements.txt
+python -m unittest discover -s tests -v
+```
+
+### What M2 proves — and what it does not
+
+M2 demonstrates protocol-level collection, tag mapping, event-to-equipment-state updates, MQTT forwarding, persistence, dashboard display, and reconnection logic. It still uses synthetic equipment values; it is not PLC integration, semiconductor process modeling, or a production-secure industrial deployment.
+
 ## Technologies
 
 ### Backend / simulation
@@ -293,6 +379,7 @@ semiconductor-fab-mes-mvp/
 - SQLAlchemy
 - psycopg2
 - Paho MQTT
+- asyncua (OPC-UA server and client)
 - Requests
 
 ### Data
@@ -340,6 +427,7 @@ API:       http://localhost:8000
 API docs:  http://localhost:8000/docs
 Postgres:  localhost:5432
 MQTT:      localhost:1883
+OPC-UA:    opc.tcp://localhost:4840/minifab/server/
 ```
 
 On the first run, the API seeds the demo product, lots, equipment, recipes, work order, and 50 wafers.
@@ -499,8 +587,7 @@ The MVP has both relational manufacturing data and semi-structured telemetry/eve
 
 The current MVP intentionally leaves out several systems that would belong in a larger production-style implementation:
 
-- no real PLC communication
-- no OPC-UA connection yet
+- no real PLC communication (OPC-UA connects only to simulated equipment)
 - no production historian
 - no Kafka/RabbitMQ layer
 - no authentication/authorization
@@ -594,15 +681,15 @@ Add:
 - maintenance records
 - explicit recipe revisions
 
-### Phase 2 — Real industrial connectivity patterns
+### Phase 2 — Real industrial connectivity patterns (M2 implemented)
 
-Add an OPC-UA equipment simulator and have the gateway support both:
+MiniFab now exposes simulated equipment over OPC-UA and has the gateway read those tags before forwarding normalized telemetry through MQTT into the MES/data layer:
 
 ```text
 OPC-UA -> Gateway -> MQTT/Event Layer -> MES
 ```
 
-This would make the project directly useful for discussing industrial protocol integration in interviews.
+Further work in this phase could include certificate-based security, OPC-UA subscriptions instead of polling, and testing against a separate vendor OPC-UA server.
 
 ### Phase 3 — Reliable distributed integration
 
@@ -730,7 +817,7 @@ Clicking equipment could reveal live telemetry, current recipe, recent alarms, m
 
 A mature version of MiniFab could credibly be described as:
 
-> Built a simulated semiconductor manufacturing environment and MES/data-integration platform that models wafer production, equipment telemetry, manufacturing events, recipes, quality inspection, downtime, and traceability. Implemented MQTT-based equipment integration, PostgreSQL manufacturing data models, REST APIs, event-driven state transitions, failure recovery, operational analytics, and an AI-assisted manufacturing investigation layer.
+> Built a simulated semiconductor manufacturing environment and MES/data-integration platform that models wafer production, equipment telemetry, manufacturing events, recipes, quality inspection, downtime, and traceability. Implemented OPC-UA-to-MQTT equipment integration, PostgreSQL manufacturing data models, REST APIs, event-driven state transitions, failure recovery, operational analytics, and an AI-assisted manufacturing investigation layer.
 
 That is the intended trajectory. The MVP in this repository is the foundation rather than the final system.
 
@@ -740,7 +827,7 @@ The project is designed to give you a concrete engineering story beyond "I made 
 
 A useful explanation is:
 
-> I built a simulated semiconductor fab where wafers move through multiple process operations. Equipment generates telemetry over MQTT, a gateway persists that information, and an MES-style API maintains wafer/process state and genealogy. I also simulated equipment failure so the system had to put a wafer on hold and resume it after maintenance.
+> I built a simulated semiconductor fab where wafers move through multiple process operations. Equipment exposes telemetry over OPC-UA, a gateway reads and normalizes it before forwarding it through MQTT to PostgreSQL, and an MES-style API maintains wafer/process state and genealogy. I also simulated equipment failure so the system had to put a wafer on hold and resume it after maintenance.
 
 From there, the later milestones can demonstrate distributed systems, industrial protocols, database design, reliability engineering, analytics, and AI.
 

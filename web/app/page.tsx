@@ -15,6 +15,14 @@ type Equipment = {
   utilization_seconds: number;
   total_runtime_seconds: number;
   last_event_at: string | null;
+  telemetry_recorded_at: string | null;
+  temperature_c: number | null;
+  pressure_mtorr: number | null;
+  rf_power_w: number | null;
+  telemetry_status: string | null;
+  telemetry_source: string | null;
+  telemetry_alarm_code: string | null;
+  telemetry_last_event: string | null;
 };
 
 type Wafer = {
@@ -116,20 +124,6 @@ export default function Dashboard() {
     return order.map(process => wafers.filter(w => w.current_process === process && ['READY', 'PROCESSING', 'HOLD'].includes(w.status)).length);
   }, [wafers]);
 
-  const fabFlow = useMemo(() => {
-    const order = ['LITHOGRAPHY', 'ETCH', 'DEPOSITION', 'INSPECTION'];
-    return order.map(process => {
-      const station = equipment.find(eq => eq.process_type === process);
-      return {
-        process,
-        equipmentCode: station?.equipment_code ?? '—',
-        name: station?.name ?? process,
-        status: station?.status ?? 'IDLE',
-        wafer: station?.current_wafer_id ?? '—',
-      };
-    });
-  }, [equipment]);
-
   const inspect = async (code: string) => {
     setSelectedCode(code);
     try {
@@ -169,26 +163,6 @@ export default function Dashboard() {
         <Metric label="Inspection yield" value={dashboard ? `${dashboard.yield_pct}%` : '—'} />
       </section>
 
-      <section className="panel fab-visual-panel">
-        <div className="panel-title"><h2>Fab floor view</h2><span>live process flow</span></div>
-        <div className="fab-flow">
-          {fabFlow.map((station, index) => (
-            <div className="fab-station-wrap" key={station.process}>
-              <div className={`fab-station ${station.status.toLowerCase()}`}>
-                <div className="station-header">
-                  <span className="station-label">{station.process}</span>
-                  <span className={`station-status ${station.status.toLowerCase()}`}>{station.status}</span>
-                </div>
-                <strong>{station.equipmentCode}</strong>
-                <span>{station.name}</span>
-                <div className="station-wafer">{station.wafer === '—' ? 'Awaiting wafer' : station.wafer}</div>
-              </div>
-              {index < fabFlow.length - 1 && <div className="fab-arrow">→</div>}
-            </div>
-          ))}
-        </div>
-      </section>
-
       <section className="grid-two">
         <article className="panel">
           <div className="panel-title"><h2>Equipment</h2><span>4 simulated stations</span></div>
@@ -202,6 +176,12 @@ export default function Dashboard() {
                 <div className="equipment-mid">
                   <span>{eq.process_type}</span>
                   <span>{eq.current_wafer_id || 'No wafer'}</span>
+                </div>
+                <div className="equipment-telemetry">
+                  <span>Temp: {eq.temperature_c == null ? '—' : `${Number(eq.temperature_c).toFixed(1)} °C`}</span>
+                  <span>Pressure: {eq.pressure_mtorr == null ? '—' : `${Number(eq.pressure_mtorr).toFixed(2)} mTorr`}</span>
+                  <span>RF: {eq.rf_power_w == null ? '—' : `${Number(eq.rf_power_w).toFixed(1)} W`}</span>
+                  <span className="telemetry-source">{eq.telemetry_source ? eq.telemetry_source.toUpperCase() : 'Waiting for OPC-UA'} · {fmtDate(eq.telemetry_recorded_at)}</span>
                 </div>
                 <span className={statusClass(eq.status)}>{eq.status}</span>
               </div>

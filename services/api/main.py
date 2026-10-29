@@ -149,11 +149,25 @@ def dashboard() -> dict[str, Any]:
 def equipment() -> list[dict[str, Any]]:
     with engine.connect() as conn:
         rows = conn.execute(text("""
-            SELECT equipment_code, name, process_type, status, current_wafer_id,
-                   ROUND(utilization_seconds::numeric, 1) AS utilization_seconds,
-                   ROUND(total_runtime_seconds::numeric, 1) AS total_runtime_seconds,
-                   last_event_at
-            FROM equipment ORDER BY equipment_code
+            SELECT equipment.equipment_code, equipment.name, equipment.process_type,
+                   equipment.status, equipment.current_wafer_id,
+                   ROUND(equipment.utilization_seconds::numeric, 1) AS utilization_seconds,
+                   ROUND(equipment.total_runtime_seconds::numeric, 1) AS total_runtime_seconds,
+                   equipment.last_event_at, latest.recorded_at AS telemetry_recorded_at,
+                   latest.temperature_c, latest.pressure_mtorr, latest.rf_power_w,
+                   latest.status AS telemetry_status,
+                   latest.payload->>'source' AS telemetry_source,
+                   latest.payload->>'alarm_code' AS telemetry_alarm_code,
+                   latest.payload->>'last_event' AS telemetry_last_event
+            FROM equipment
+            LEFT JOIN LATERAL (
+                SELECT recorded_at, temperature_c, pressure_mtorr, rf_power_w, status, payload
+                FROM telemetry
+                WHERE telemetry.equipment_id=equipment.id
+                ORDER BY recorded_at DESC, id DESC
+                LIMIT 1
+            ) latest ON TRUE
+            ORDER BY equipment.equipment_code
         """)).mappings().all()
     return [dict(r) for r in rows]
 
