@@ -360,6 +360,12 @@ export default function Dashboard() {
     }));
   }, [wafers]);
 
+  const equipmentByProcess = useMemo(() => {
+    const result: Record<string, Equipment | undefined> = {};
+    for (const item of equipment) result[item.process_type] = item;
+    return result;
+  }, [equipment]);
+
   const selectEquipment = async (equipmentCode: string) => {
     setSelectedWafer(null);
     setSelectedWaferCode(null);
@@ -452,35 +458,86 @@ export default function Dashboard() {
         <Metric label="Inspection yield" value={dashboard ? `${dashboard.yield_pct}%` : '—'} note="Passed / recorded quality results" />
       </section>
 
+      <section className="panel pipeline-panel">
+        <div className="panel-title panel-title-wrap">
+          <div><p className="eyebrow">DATA PATH</p><h2>Integration pipeline health</h2></div>
+          <span className={statusClass(telemetryStatus)}>{telemetryStatus.toUpperCase()}</span>
+        </div>
+        <div className="integration-flow">
+          {integrationSteps.map((step, index) => (
+            <div className="integration-step-wrap" key={step.name}>
+              <article className={`integration-step ${step.status}`}>
+                <div className="step-topline"><span className="step-number">{step.icon}</span><span className={statusClass(step.status)}>{step.status}</span></div>
+                <strong>{step.name}</strong>
+                <p>{step.detail}</p>
+              </article>
+              {index < integrationSteps.length - 1 && <span className={`integration-connector ${step.status === 'healthy' ? 'active' : ''}`} aria-hidden="true">→</span>}
+            </div>
+          ))}
+        </div>
+        <div className="pipeline-footer">
+          <span><span className="legend-dot healthy" /> Healthy</span>
+          <span><span className="legend-dot degraded" /> Degraded / partial</span>
+          <span><span className="legend-dot down" /> No fresh data / failure</span>
+          <p>{health?.note || 'Health is inferred from the API and recent telemetry records.'}</p>
+        </div>
+      </section>
+
+      <section className="panel factory-panel">
+        <div className="panel-title panel-title-wrap">
+          <div><p className="eyebrow">LIVE PRODUCTION</p><h2>Factory floor</h2></div>
+          <span>Click a station to inspect telemetry and alarms</span>
+        </div>
+        <div className="factory-flow">
+          {PROCESS_ORDER.map((process, index) => {
+            const station = equipmentByProcess[process];
+            const wip = wipByProcess.find((item) => item.process === process)?.count || 0;
+            const state = machineStatus(station);
+            const isDown = /down|alarm|fault|hold/i.test(state);
+            const isRunning = /running|processing/i.test(state);
+            const latestAge = health?.equipment.find((item) => item.equipment_code === station?.equipment_code)?.sample_age_seconds;
+            return (
+              <div className="factory-step" key={process}>
+                <button
+                  type="button"
+                  className={`station-card ${state.toLowerCase()} ${selectedEquipmentCode === station?.equipment_code ? 'selected' : ''}`}
+                  onClick={() => station && void selectEquipment(station.equipment_code)}
+                  disabled={!station}
+                  aria-label={`Inspect ${station?.equipment_code || process}`}
+                >
+                  <div className="station-header"><span className="station-number">0{index + 1}</span><span className={statusClass(state)}>{state}</span></div>
+                  <WaferGlyph />
+                  <strong>{station?.equipment_code || 'Waiting…'}</strong>
+                  <span className="station-name">{PROCESS_LABELS[process]}</span>
+                  <div className="station-current">
+                    <span>Current wafer</span>
+                    <b>{station?.current_wafer_id || 'No wafer'}</b>
+                  </div>
+                  <div className="station-readings">
+                    <span>{station?.temperature_c == null ? '—' : `${Number(station.temperature_c).toFixed(1)}°C`}</span>
+                    <span>{station?.pressure_mtorr == null ? '—' : `${Number(station.pressure_mtorr).toFixed(1)} mTorr`}</span>
+                  </div>
+                  <div className="station-footer"><span>{wip} WIP</span><span className={`sample-freshness ${latestAge != null && latestAge <= 10 ? 'fresh' : ''}`}>{latestAge != null ? timeAgo(latestAge) : 'No sample'}</span></div>
+                  {isDown && <div className="station-alert"><span className="alert-triangle">!</span>{station?.telemetry_last_event || 'Equipment attention required'}</div>}
+                  {isRunning && <div className="station-running-line"><span /></div>}
+                </button>
+                {index < PROCESS_ORDER.length - 1 && <div className="factory-connector" aria-hidden="true"><span>→</span></div>}
+              </div>
+            );
+          })}
+        </div>
+        <div className="factory-legend">
+          <span><span className="legend-dot running" /> Running</span>
+          <span><span className="legend-dot idle" /> Idle</span>
+          <span><span className="legend-dot hold" /> Hold</span>
+          <span><span className="legend-dot down" /> Down / alarm</span>
+          <span className="synthetic-label">Synthetic equipment values · not physical process measurements</span>
+        </div>
+      </section>
+
       <section className="grid-two">
         <article className="panel">
-          <div className="panel-title"><h2>Equipment</h2><span>4 simulated stations</span></div>
-          <div className="equipment-list">
-            {equipment.map(eq => (
-              <div className="equipment-row" key={eq.equipment_code}>
-                <div>
-                  <strong>{eq.equipment_code}</strong>
-                  <span>{eq.name}</span>
-                </div>
-                <div className="equipment-mid">
-                  <span>{eq.process_type}</span>
-                  <span>{eq.current_wafer_id || 'No wafer'}</span>
-                </div>
-                <div className="equipment-telemetry">
-                  <span>Temp: {eq.temperature_c == null ? '—' : `${Number(eq.temperature_c).toFixed(1)} °C`}</span>
-                  <span>Pressure: {eq.pressure_mtorr == null ? '—' : `${Number(eq.pressure_mtorr).toFixed(2)} mTorr`}</span>
-                  <span>RF: {eq.rf_power_w == null ? '—' : `${Number(eq.rf_power_w).toFixed(1)} W`}</span>
-                  <span className="telemetry-source">{eq.telemetry_source ? eq.telemetry_source.toUpperCase() : 'Waiting for OPC-UA'} · {fmtDate(eq.telemetry_recorded_at)}</span>
-                </div>
-                <span className={statusClass(eq.status)}>{eq.status}</span>
-              </div>
-            ))}
-          </div>
-          <div className="mini-note">The simulator deliberately takes ETCH-01 offline after ~35 seconds and repairs it ~15 seconds later.</div>
-        </article>
-
-        <article className="panel">
-          <div className="panel-title"><h2>WIP by process</h2><span>ready + processing + hold</span></div>
+          <div className="panel-title"><h2>Work in progress</h2><span>Ready + processing + hold</span></div>
           <div className="process-bars">
             {wipByProcess.map(({ process, count }) => {
               const max = Math.max(1, ...wipByProcess.map((item) => item.count));
