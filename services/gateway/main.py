@@ -1,14 +1,26 @@
+import asyncio
 import json
 import os
+import threading
 import time
 from datetime import datetime, timezone
 
+from asyncua import Client
 import paho.mqtt.client as mqtt
 from sqlalchemy import create_engine, text
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg2://fab:fab@localhost:5432/fab")
 MQTT_HOST = os.getenv("MQTT_HOST", "localhost")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
+OPCUA_URL = os.getenv("OPCUA_URL", "opc.tcp://localhost:4840/minifab/server/")
+OPCUA_NAMESPACE_URI = os.getenv("OPCUA_NAMESPACE_URI", "urn:minifab:equipment")
+OPCUA_SAMPLE_INTERVAL = float(os.getenv("OPCUA_SAMPLE_INTERVAL", "0.5"))
+EQUIPMENT_CODES = ("LITHO-01", "ETCH-01", "DEP-01", "METRO-01")
+OPCUA_FIELDS = (
+    "TemperatureC", "PressureMTorr", "RFPowerW", "MachineState",
+    "CurrentWaferCode", "RemainingSeconds", "ProcessType", "RuntimeIncrementSeconds",
+    "Timestamp", "AlarmCode", "LastEvent",
+)
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
 
@@ -140,6 +152,63 @@ def on_message(client, userdata, msg):
         print(f"[gateway] message error: {exc}")
 
 
+async def read_opcua(client: mqtt.Client) -> None:
+    while True:
+        try:
+            async with Client(url=OPCUA_URL, timeout=5) as opcua:
+                namespace = await opcua.get_namespace_index(OPCUA_NAMESPACE_URI)
+                root = await opcua.nodes.objects.get_child([f"{namespace}:Equipment"])
+                nodes = {}
+                for equipment_code in EQUIPMENT_CODES:
+                    machine = await root.get_child([f"{namespace}:{equipment_code}"])
+                    nodes[equipment_code] = {
+                        field: await machine.get_child([f"{namespace}:{field}"])
+                        for field in OPCUA_FIELDS
+                    }
+                print(f"[gateway] OPC-UA connected; monitoring {len(nodes)} equipment assets", flush=True)
+                previous = {}
+                last_published = {}
+                while True:
+                    for equipment_code, equipment_nodes in nodes.items():
+                        values = await opcua.read_values(list(equipment_nodes.values()))
+                        snapshot = dict(zip(OPCUA_FIELDS, values))
+                        if snapshot == previous.get(equipment_code):
+                            continue
+                        previous[equipment_code] = snapshot.copy()
+                        source_timestamp = snapshot["Timestamp"]
+                        collected_at = time.monotonic()
+                        elapsed = max(0.0, collected_at - last_published.get(equipment_code, collected_at))
+                        last_published[equipment_code] = collected_at
+                        payload = {
+                            "equipment_code": equipment_code,
+                            "wafer_code": snapshot["CurrentWaferCode"] or None,
+                            "timestamp": source_timestamp,
+                            "temperature_c": snapshot["TemperatureC"],
+                            "pressure_mtorr": snapshot["PressureMTorr"],
+                            "rf_power_w": snapshot["RFPowerW"],
+                            "status": snapshot["MachineState"],
+                            "process_type": snapshot["ProcessType"],
+                            "remaining_seconds": snapshot["RemainingSeconds"],
+                            "runtime_increment_seconds": elapsed if snapshot["MachineState"] == "RUNNING" else 0.0,
+                            "alarm_code": snapshot["AlarmCode"],
+                            "last_event": snapshot["LastEvent"],
+                            "source": "opcua",
+                        }
+                        client.publish(
+                            f"fab/telemetry/normalized/{equipment_code}",
+                            json.dumps(payload),
+                            qos=1,
+                        )
+                    await asyncio.sleep(OPCUA_SAMPLE_INTERVAL)
+        except Exception as exc:
+            print(f"[gateway] OPC-UA connection/read failed: {exc}; retrying in 3 seconds", flush=True)
+            await asyncio.sleep(3)
+
+
+def start_opcua_reader(client: mqtt.Client) -> None:
+    asyncio.run(read_opcua(client))
+
+
 def main():
     while True:
         try:
@@ -147,7 +216,10 @@ def main():
             client.on_connect = on_connect
             client.on_message = on_message
             client.connect(MQTT_HOST, MQTT_PORT, 60)
-            client.loop_forever()
+            client.loop_start()
+            threading.Thread(target=start_opcua_reader, args=(client,), name="opcua-reader", daemon=True).start()
+            while True:
+                time.sleep(3600)
         except Exception as exc:
             print(f"[gateway] reconnecting after error: {exc}")
             time.sleep(3)
