@@ -172,6 +172,119 @@ def equipment() -> list[dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
+@app.get("/equipment/{equipment_code}/telemetry")
+def equipment_telemetry(
+    equipment_code: str,
+    limit: int = Query(60, ge=5, le=300),
+) -> list[dict[str, Any]]:
+    """Return recent persisted samples for equipment detail charts."""
+    with engine.connect() as conn:
+        equipment_row = conn.execute(
+            text("SELECT id FROM equipment WHERE equipment_code=:code"),
+            {"code": equipment_code},
+        ).first()
+        if not equipment_row:
+            raise HTTPException(status_code=404, detail="Equipment not found")
+        rows = conn.execute(text("""
+            SELECT id, recorded_at, temperature_c, pressure_mtorr, rf_power_w, status,
+                   payload->>'source' AS source,
+                   payload->>'alarm_code' AS alarm_code,
+                   payload->>'last_event' AS last_event,
+                   payload
+            FROM telemetry
+            WHERE equipment_id=:equipment_id
+            ORDER BY recorded_at DESC, id DESC
+            LIMIT :limit
+        """), {"equipment_id": equipment_row.id, "limit": limit}).mappings().all()
+    # Reverse newest-first rows so charts render left-to-right in time.
+    return [dict(row) for row in reversed(rows)]
+
+
+@app.get("/integration/health")
+def integration_health() -> dict[str, Any]:
+    """Report end-to-end pipeline evidence based on recently persisted OPC-UA samples.
+
+    This does not claim to query the MQTT broker or OPC-UA server directly; it checks
+    whether OPC-UA-labelled equipment data has recently completed the gateway/MQTT/DB path.
+    """
+    now = datetime.now(timezone.utc)
+    with engine.connect() as conn:
+        conn.execute(text("SELECT 1"))
+        rows = conn.execute(text("""
+            SELECT e.equipment_code, latest.recorded_at, latest.source, latest.last_event
+            FROM equipment e
+            LEFT JOIN LATERAL (
+                SELECT t.recorded_at, t.payload->>'source' AS source,
+                       t.payload->>'last_event' AS last_event
+                FROM telemetry t
+                WHERE t.equipment_id=e.id
+                ORDER BY t.recorded_at DESC, t.id DESC
+                LIMIT 1
+            ) latest ON TRUE
+            ORDER BY e.equipment_code
+        """)).mappings().all()
+        latest_row = conn.execute(text("SELECT MAX(recorded_at) AS latest_at FROM telemetry")).mappings().one()
+        minute_count = conn.execute(text("SELECT COUNT(*) FROM telemetry WHERE recorded_at >= NOW() - INTERVAL '60 seconds'")).scalar_one()
+
+    equipment_status = []
+    fresh_opcua_count = 0
+    for row in rows:
+        recorded_at = row["recorded_at"]
+        age_seconds = None
+        if recorded_at is not None:
+            if recorded_at.tzinfo is None:
+                recorded_at = recorded_at.replace(tzinfo=timezone.utc)
+            age_seconds = max(0.0, (now - recorded_at).total_seconds())
+        fresh = row["source"] == "opcua" and age_seconds is not None and age_seconds <= 10
+        if fresh:
+            fresh_opcua_count += 1
+        equipment_status.append({
+            "equipment_code": row["equipment_code"],
+            "latest_sample_at": row["recorded_at"],
+            "sample_age_seconds": round(age_seconds, 1) if age_seconds is not None else None,
+            "source": row["source"],
+            "last_event": row["last_event"],
+            "fresh": fresh,
+        })
+
+    latest_at = latest_row["latest_at"]
+    latest_age = None
+    if latest_at is not None:
+        if latest_at.tzinfo is None:
+            latest_at = latest_at.replace(tzinfo=timezone.utc)
+        latest_age = max(0.0, (now - latest_at).total_seconds())
+
+    total_equipment = len(equipment_status)
+    if total_equipment and fresh_opcua_count >= min(2, total_equipment) and latest_age is not None and latest_age <= 10:
+        pipeline_status = "healthy"
+        pipeline_detail = f"Fresh OPC-UA-derived samples from {fresh_opcua_count} of {total_equipment} machines reached PostgreSQL."
+    elif latest_age is not None and latest_age <= 30 and fresh_opcua_count > 0:
+        pipeline_status = "degraded"
+        pipeline_detail = f"Some fresh OPC-UA data is arriving ({fresh_opcua_count} of {total_equipment} machines)."
+    else:
+        pipeline_status = "down"
+        pipeline_detail = "No recent OPC-UA-derived telemetry is being persisted. Check the OPC-UA server, gateway, MQTT broker, and database path."
+
+    return {
+        "generated_at": now,
+        "api_database": {
+            "status": "healthy",
+            "detail": "API is responding and the PostgreSQL query succeeded.",
+        },
+        "telemetry_pipeline": {
+            "status": pipeline_status,
+            "detail": pipeline_detail,
+            "latest_sample_at": latest_at,
+            "latest_sample_age_seconds": round(latest_age, 1) if latest_age is not None else None,
+            "samples_last_60_seconds": int(minute_count or 0),
+            "fresh_opcua_equipment": fresh_opcua_count,
+            "total_equipment": total_equipment,
+        },
+        "equipment": equipment_status,
+        "note": "Pipeline status is inferred from persisted OPC-UA-labelled telemetry; the endpoint does not directly probe OPC-UA or MQTT sockets.",
+    }
+
+
 @app.get("/wafers")
 def wafers(limit: int = Query(50, ge=1, le=200), status: str | None = None) -> list[dict[str, Any]]:
     query = """

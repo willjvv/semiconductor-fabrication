@@ -171,7 +171,7 @@ Result: PASS
 
 A configurable synthetic failure probability allows some wafers to fail inspection and become `SCRAPPED`.
 
-### Live dashboard
+### Live dashboard and operational visualizations
 
 The Next.js dashboard provides:
 
@@ -180,15 +180,17 @@ The Next.js dashboard provides:
 - completed count
 - scrapped count
 - inspection yield
-- equipment status
-- current wafer on each station
-- work-in-process by process area
-- recent manufacturing events
-- wafer queue
-- click-through wafer traceability drawer
-- process history
-- quality results
+- a **live factory-floor flow** with four clickable equipment stations, current wafer, status, WIP count, latest values, and telemetry freshness
+- an **integration pipeline view** covering OPC-UA equipment data, gateway normalization, MQTT/PostgreSQL persistence, and API/dashboard status
+- an **equipment diagnostics drawer** with temperature, pressure, and RF-power trend charts based on persisted telemetry history
+- recent equipment alarm, downtime, hold, and repair events
+- recent manufacturing events (click an equipment event to open that machine's diagnostics)
+- WIP by process area
+- wafer queue and click-through wafer traceability drawer
+- process history and quality results
 - simulation reset button
+
+Pipeline status is intentionally evidence-based: the UI infers that the telemetry path is active when recent OPC-UA-labelled samples have reached PostgreSQL. It does not claim to directly inspect the MQTT broker or gateway process. All machine telemetry in this project is synthetic.
 
 ## Architecture
 
@@ -505,6 +507,17 @@ ETCH-01
 ```
 
 and a held wafer being released.
+
+## New dashboard API endpoints
+
+The operational-visibility dashboard adds two endpoints:
+
+```text
+GET /integration/health
+GET /equipment/{equipment_code}/telemetry?limit=60
+```
+
+`/integration/health` checks that the API can query PostgreSQL and summarizes whether fresh OPC-UA-labelled samples have recently been persisted. `/equipment/{equipment_code}/telemetry` returns recent stored telemetry for the equipment trend charts. `limit` is configurable from 5 to 300 samples.
 
 ## Useful API calls
 
